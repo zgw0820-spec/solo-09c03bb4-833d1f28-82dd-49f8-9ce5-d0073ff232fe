@@ -4,4 +4,5 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY mock_upstream.py .
 EXPOSE 5353/udp
+EXPOSE 5353/tcp
 CMD ["python", "mock_upstream.py"]

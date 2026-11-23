@@ -24,6 +24,30 @@ Behaviour summary
   reply arrived.
 * Upstream timeout, inconsistent endpoints, or an expired synthesis basis
   all produce SERVFAIL.
+
+Truncation (TC) handling
+------------------------
+The expanded collector puts many A records behind one name, so an upstream
+UDP reply may come back with the TC (truncation) bit set and only part of the
+answer section.  Acting on such a reply would hand the collector a partial
+set of synthesized addresses; a truncated *empty* AAAA answer would also
+falsely trigger the follow-up A query.
+
+Therefore every upstream query (AAAA, A, and the transparent proxy path)
+works like this:
+
+1. Send the query over UDP.
+2. If the UDP reply has TC=1, re-ask the **same question to the same
+   upstream over TCP** and use only the complete TCP reply.
+3. The UDP attempt and the TCP retry share the single timeout budget of the
+   original query.  A deadline is taken once; TCP reads of a segmented
+   response re-use the *remaining* budget, so slow segment delivery can
+   never extend the overall wait.
+4. If the retry cannot deliver a complete, non-truncated answer in time (or
+   the UDP attempt itself fails), the whole upstream exchange fails and the
+   client gets SERVFAIL.
+
+The collector-facing service stays UDP-only.
 """
 
 from __future__ import annotations
@@ -32,6 +56,7 @@ import ipaddress
 import logging
 import os
 import socket
+import struct
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -53,7 +78,11 @@ def _norm(name) -> str:
 
 
 class UpstreamTimeout(Exception):
-    """Raised when the upstream does not answer within the timeout."""
+    """Raised when the upstream does not answer within the timeout budget."""
+
+
+class UpstreamError(Exception):
+    """Raised when an upstream transport exchange fails (other than timeout)."""
 
 
 @dataclass
@@ -61,6 +90,8 @@ class UpstreamExchange:
     """An upstream reply plus the moment it arrived.
 
     Remaining TTLs of every record in the reply are counted from ``arrived``.
+    For a UDP->TCP fallback this is the moment the complete TCP reply was
+    received, i.e. the arrival of the (only) reply the synthesis relies on.
     """
 
     reply: DNSRecord
@@ -71,16 +102,169 @@ class UpstreamExchange:
         return ttl - (now - self.arrived)
 
 
-def query_upstream(name: str, qtype: str, host: str, port: int, timeout: float) -> UpstreamExchange:
-    """Send one UDP query to the upstream and return the timed reply."""
-    q = DNSRecord.question(name, qtype)
+def _family(host: str) -> int:
+    return socket.AF_INET6 if ":" in host else socket.AF_INET
+
+
+def _recv_udp(host: str, port: int, packet: bytes, deadline: float) -> bytes:
+    """One UDP exchange. Must finish (reply in hand) before ``deadline``."""
+    sock = socket.socket(_family(host), socket.SOCK_DGRAM)
     try:
-        reply = q.send(host, port, tcp=False, timeout=timeout)
-    except (socket.timeout, TimeoutError) as exc:
-        raise UpstreamTimeout(f"upstream {host}:{port} timed out after {timeout}s") from exc
-    except OSError as exc:  # e.g. ICMP port unreachable -> ECONNREFUSED on UDP
+        sock.settimeout(max(0.0, deadline - time.monotonic()))
+        sock.sendto(packet, (host, port))
+        while True:
+            timeout = deadline - time.monotonic()
+            if timeout <= 0:
+                raise UpstreamTimeout(
+                    f"upstream {host}:{port} UDP deadline reached before reply")
+            sock.settimeout(timeout)
+            try:
+                data, sender = sock.recvfrom(8192)
+            except socket.timeout as exc:
+                raise UpstreamTimeout(
+                    f"upstream {host}:{port} timed out within the query budget"
+                ) from exc
+            # The socket talks to a single upstream; accept its first reply.
+            return data
+    finally:
+        sock.close()
+
+
+def _recv_tcp(host: str, port: int, packet: bytes, deadline: float) -> bytes:
+    """One TCP exchange reusing the remaining budget up to ``deadline``.
+
+    The 2-octet length prefix and every segment are read against the same
+    deadline, so a response that arrives in many segments can never extend
+    the wait beyond the original query's budget.
+    """
+    family = _family(host)
+    sock = socket.socket(family, socket.SOCK_STREAM)
+    try:
+        timeout = deadline - time.monotonic()
+        if timeout <= 0:
+            raise UpstreamTimeout(
+                f"upstream {host}:{port} TCP: no budget left for the retry")
+        sock.settimeout(timeout)
+        try:
+            sock.connect((host, port))
+        except socket.timeout as exc:
+            raise UpstreamTimeout(
+                f"upstream {host}:{port} TCP connect exceeded the query budget"
+            ) from exc
+        except OSError as exc:
+            raise UpstreamError(f"upstream {host}:{port} TCP connect failed: {exc}") from exc
+
+        wire = struct.pack("!H", len(packet)) + packet
+
+        def _wait_remaining() -> float:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise UpstreamTimeout(
+                    f"upstream {host}:{port} TCP deadline reached mid-message")
+            sock.settimeout(remaining)
+            return remaining
+
+        # sendall may also block; keep it inside the same budget.
+        _wait_remaining()
+        try:
+            sock.sendall(wire)
+        except socket.timeout as exc:
+            raise UpstreamTimeout(
+                f"upstream {host}:{port} TCP send exceeded the query budget"
+            ) from exc
+        except OSError as exc:
+            raise UpstreamError(f"upstream {host}:{port} TCP send failed: {exc}") from exc
+
+        # Length prefix (exactly 2 bytes).
+        header = b""
+        while len(header) < 2:
+            _wait_remaining()
+            try:
+                chunk = sock.recv(2 - len(header))
+            except socket.timeout as exc:
+                raise UpstreamTimeout(
+                    f"upstream {host}:{port} TCP timed out reading length prefix"
+                ) from exc
+            except OSError as exc:
+                raise UpstreamError(f"upstream {host}:{port} TCP read failed: {exc}") from exc
+            if not chunk:
+                raise UpstreamError(f"upstream {host}:{port} TCP closed before length prefix")
+            header += chunk
+        length = struct.unpack("!H", header)[0]
+
+        # Full message, however many segments it arrives in.
+        chunks: list[bytes] = []
+        received = 0
+        while received < length:
+            _wait_remaining()
+            try:
+                chunk = sock.recv(min(8192, length - received))
+            except socket.timeout as exc:
+                raise UpstreamTimeout(
+                    f"upstream {host}:{port} TCP timed out reading message "
+                    f"({received}/{length} bytes)"
+                ) from exc
+            except OSError as exc:
+                raise UpstreamError(f"upstream {host}:{port} TCP read failed: {exc}") from exc
+            if not chunk:
+                raise UpstreamError(
+                    f"upstream {host}:{port} TCP closed after {received}/{length} bytes")
+            chunks.append(chunk)
+            received += len(chunk)
+        return b"".join(chunks)
+    finally:
+        sock.close()
+
+
+def query_upstream(name: str, qtype: str, host: str, port: int,
+                   timeout: float) -> UpstreamExchange:
+    """Resolve one question against the upstream with a shared timeout budget.
+
+    UDP is tried first; a truncated (TC=1) UDP reply is retried over TCP to
+    the same host/port with the *same* question, reusing whatever time of the
+    original ``timeout`` budget remains.  Returns only a complete,
+    non-truncated reply; otherwise raises :class:`UpstreamTimeout` or
+    :class:`UpstreamError`.
+    """
+    question = DNSRecord.question(name, qtype)
+    packet = question.pack()
+    deadline = time.monotonic() + timeout
+
+    try:
+        raw = _recv_udp(host, port, packet, deadline)
+    except UpstreamTimeout:
+        raise
+    except OSError as exc:  # e.g. ICMP port unreachable -> ECONNREFUSED
         raise UpstreamTimeout(f"upstream {host}:{port} unreachable: {exc}") from exc
-    return UpstreamExchange(reply=DNSRecord.parse(reply) if isinstance(reply, bytes) else reply)
+
+    reply = DNSRecord.parse(raw)
+    if not reply.header.tc:
+        return UpstreamExchange(reply=reply)
+
+    log.info(
+        "upstream %s:%s UDP reply for %s %s has TC=1 (%d answer(s)); "
+        "retrying over TCP with the remaining budget",
+        host, port, name, qtype, len(reply.rr),
+    )
+    try:
+        tcp_raw = _recv_tcp(host, port, packet, deadline)
+    except UpstreamTimeout as exc:
+        log.warning(
+            "upstream %s:%s TCP retry for %s %s failed within the shared "
+            "budget: %s", host, port, name, qtype, exc,
+        )
+        raise
+    tcp_reply = DNSRecord.parse(tcp_raw)
+    if tcp_reply.header.tc:
+        # TCP messages are not supposed to be truncated; a set TC means we
+        # still do not have the complete answer.
+        raise UpstreamError(
+            f"upstream {host}:{port} TCP reply for {name} {qtype} still has TC=1")
+    log.info(
+        "upstream %s:%s TCP retry for %s %s delivered %d answer(s)",
+        host, port, name, qtype, len(tcp_reply.rr),
+    )
+    return UpstreamExchange(reply=tcp_reply)
 
 
 # ---------------------------------------------------------------------------
@@ -146,19 +330,22 @@ class DNS64Resolver(BaseResolver):
         if qtype != "AAAA":
             # Transparent proxy for anything that is not an AAAA query.
             try:
-                up = query_upstream(qname, qtype, self.upstream_host, self.upstream_port, self.timeout)
-            except UpstreamTimeout:
+                up = query_upstream(qname, qtype, self.upstream_host,
+                                    self.upstream_port, self.timeout)
+            except (UpstreamTimeout, UpstreamError) as exc:
+                log.warning("%s %s: %s -> SERVFAIL", qtype, qname, exc)
                 return self._servfail(request)
             return self._passthrough(request, up.reply)
         try:
             return self._resolve_aaaa(request, qname)
-        except UpstreamTimeout as exc:
+        except (UpstreamTimeout, UpstreamError) as exc:
             log.warning("AAAA %s: %s -> SERVFAIL", qname, exc)
             return self._servfail(request)
 
     # -- AAAA handling -------------------------------------------------------
     def _resolve_aaaa(self, request: DNSRecord, qname: str) -> DNSRecord:
-        aaaa_up = query_upstream(qname, "AAAA", self.upstream_host, self.upstream_port, self.timeout)
+        aaaa_up = query_upstream(qname, "AAAA", self.upstream_host,
+                                 self.upstream_port, self.timeout)
         reply = aaaa_up.reply
         rcode = RCODE[reply.header.rcode]
 
@@ -173,6 +360,8 @@ class DNS64Resolver(BaseResolver):
             return self._passthrough(request, reply)
 
         # NOERROR + no AAAA in the answer: the name exists but has no AAAA.
+        # A truncated empty answer can never reach this point: query_upstream
+        # would have retried it over TCP first.
         endpoint_aaaa = extract_endpoint(reply, qname)
         neg_ttl = extract_negative_ttl(reply)
         log.info(
@@ -180,7 +369,8 @@ class DNS64Resolver(BaseResolver):
             qname, endpoint_aaaa, neg_ttl,
         )
 
-        a_up = query_upstream(qname, "A", self.upstream_host, self.upstream_port, self.timeout)
+        a_up = query_upstream(qname, "A", self.upstream_host,
+                              self.upstream_port, self.timeout)
         a_reply = a_up.reply
         if RCODE[a_reply.header.rcode] != "NOERROR":
             # e.g. A is NXDOMAIN while AAAA was NODATA: endpoints cannot be
@@ -270,7 +460,8 @@ class DNS64Resolver(BaseResolver):
 
 
 def make_server(resolver: DNS64Resolver, host: str, port: int) -> DNSServer:
-    # UDP only: the collector-facing service listens for UDP AAAA queries.
+    # UDP only on the client side: the collector keeps sending UDP AAAA
+    # queries.  TCP is used only for upstream retries inside the resolver.
     return DNSServer(resolver, address=host, port=port, tcp=False)
 
 

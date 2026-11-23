@@ -4,6 +4,7 @@ services:
     container_name: dns64-sample-upstream
     expose:
       - "5353/udp"
+      - "5353/tcp"
     networks:
       - dns64net
 

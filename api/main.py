@@ -27,6 +27,10 @@ SCENARIOS = {
     "flap": ("flap.example.", "AAAA — the two upstream replies alias to different endpoints -> SERVFAIL"),
     "multi": ("multi.example.", "AAAA — two A records, TTL = min of all bases"),
     "timeout": ("drop.example.", "AAAA — upstream never answers -> SERVFAIL"),
+    "tc_many": ("tc-many.example.", "AAAA — truncated UDP (TC=1), TCP retry yields the full 3-record synthesis"),
+    "tc_empty": ("tc-empty.example.", "AAAA — truncated empty AAAA on UDP, retried over TCP before the A query"),
+    "tc_expire": ("tc-expire.example.", "AAAA — TCP retry arrives after the no-AAAA negative TTL expired -> SERVFAIL"),
+    "tc_drop": ("tcdrop.example.", "AAAA — TC=1 on UDP but TCP never answers within the shared budget -> SERVFAIL"),
 }
 
 app = FastAPI(
